@@ -15,10 +15,10 @@ measure of wisdom.
 No dependencies. Python 3.10 or later.
 
 ```
-pip install https://github.com/keith448/virtuos-eval/releases/download/v0.1.0/virtuos_eval-0.1.0-py3-none-any.whl
+pip install https://github.com/keith448/virtuos-eval/releases/download/v0.1.1/virtuos_eval-0.1.1-py3-none-any.whl
 ```
 
-The package is not on PyPI yet. The wheel is attached to the v0.1.0 release.
+The package is not on PyPI yet. The wheel is attached to the v0.1.1 release.
 
 ## Use
 
@@ -40,6 +40,33 @@ Providers: `echo`, `random`, `longest`, `shortest`, `openai`, `anthropic`,
 
 `validate` checks a set of items for three cheap cues: answer position, answer
 length, and copying the situation's words.
+
+## For an app
+
+Keep the score in memory:
+
+```python
+from virtuos_eval import Corpus, build_items, evaluate, get_provider
+
+corpus = Corpus.load()
+items = build_items(corpus, virtues=["reciprocity"], n=30, seed=0)
+provider = get_provider("openai", model="gpt-5")
+summary = evaluate(items, provider)
+print(summary["accuracy"], summary["wilson95"], summary["errors"])
+```
+
+`summary` carries the rows, accuracy, interval, and tables by virtue, layer and
+tradition.
+
+## Retries and resume
+
+Provider calls retry on 429, 5xx and network errors, with backoff and
+`Retry-After` respected. A failed call is recorded as an error, and the run
+continues. Each result is appended as it arrives. Rerun into the same directory
+to skip answered items and retry only the errors; use `--fresh` to start over.
+
+`--json` prints the summary as JSON. `--retries` and `--timeout` set the HTTP
+budget.
 
 ## Why it exists
 

@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 from importlib import resources
+from pathlib import Path
 
 from . import __version__
 from .corpus import Corpus
@@ -86,6 +87,8 @@ def cmd_test(args) -> int:
         host=args.host,
         seed=args.seed,
         letter=args.letter,
+        retries=args.retries,
+        timeout=args.timeout,
     )
     out = run(
         items,
@@ -95,9 +98,15 @@ def cmd_test(args) -> int:
         corpus_version=corpus.version,
         design=args.design,
         label=args.label,
-        verbose=not args.quiet,
+        verbose=not (args.quiet or args.json),
+        fresh=args.fresh,
     )
-    print(out)
+    if args.json:
+        meta = json.loads((Path(out) / "meta.json").read_text(encoding="utf-8"))
+        meta["run_dir"] = str(out)
+        print(json.dumps(meta, indent=2))
+    else:
+        print(out)
     return 0
 
 
@@ -125,8 +134,6 @@ def cmd_validate(args) -> int:
     text = validation_report(validate_items(items))
     print(text)
     if args.out:
-        from pathlib import Path
-
         Path(args.out).write_text(text, encoding="utf-8")
         print(f"Wrote {args.out}")
     return 0
@@ -181,6 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="output directory")
     p.add_argument("--label", help="name for the run and report")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--json", action="store_true", help="print the summary as JSON")
+    p.add_argument("--fresh", action="store_true", help="ignore an existing results file and start over")
+    p.add_argument("--retries", type=int, default=4, help="retries per model call on 429/5xx/network errors")
+    p.add_argument("--timeout", type=float, default=60.0, help="seconds per model call")
 
     p = sub.choices["export"]
     p.add_argument("--out", default="virtuos-v0.1-draft.jsonl")

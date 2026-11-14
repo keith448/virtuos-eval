@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-import re
 import os
 import random
+import re
+import time
 import urllib.error
 import urllib.request
 
 LETTERS = ("A", "B", "C")
+RETRYABLE = {429, 500, 502, 503, 504}
 
 
 def parse_letter(text: str) -> str | None:
@@ -23,6 +25,45 @@ def parse_letter(text: str) -> str | None:
         return match.group(1).upper()
     match = re.search(r"\b([ABC])\b", text)
     return match.group(1).upper() if match else None
+
+
+class RetryPolicy:
+    """Retry budget for HTTP calls.
+
+    The providers read from hosted APIs, so a run of a hundred items will meet a
+    429 or a dropped connection eventually. Retry those; never retry a 400.
+    """
+
+    def __init__(self, retries: int = 4, base_delay: float = 1.0, timeout: float = 60.0):
+        self.retries = max(0, int(retries))
+        self.base_delay = max(0.0, float(base_delay))
+        self.timeout = max(1.0, float(timeout))
+
+    def delay(self, attempt: int, exc: Exception | None = None) -> float:
+        if isinstance(exc, urllib.error.HTTPError) and exc.headers:
+            retry_after = exc.headers.get("Retry-After")
+            if retry_after and str(retry_after).isdigit():
+                return min(float(retry_after), 60.0)
+        return min(self.base_delay * (2**attempt), 30.0) + random.uniform(0, 0.25)
+
+
+def retry_call(fn, policy: RetryPolicy):
+    """Call fn, retrying transient failures. Non-retryable errors pass through."""
+    last: Exception | None = None
+    for attempt in range(policy.retries + 1):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code not in RETRYABLE or attempt == policy.retries:
+                raise
+            time.sleep(policy.delay(attempt, exc))
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            last = exc
+            if attempt == policy.retries:
+                raise
+            time.sleep(policy.delay(attempt))
+    raise last  # pragma: no cover
 
 
 class Provider:
@@ -89,24 +130,39 @@ class ShortestProvider(Provider):
         return min(options, key=lambda letter: len(options[letter]))
 
 
-def _post_json(url: str, payload: dict, headers: dict, timeout: int = 60) -> dict:
+def _post_json(url: str, payload: dict, headers: dict, policy: RetryPolicy) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+
+    def send():
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=policy.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    try:
+        return retry_call(send, policy)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:500]
         raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"request to {url} failed: {exc}") from exc
 
 
 class OpenAIProvider(Provider):
     name = "openai"
 
-    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None):
+    def __init__(
+        self,
+        model: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        *,
+        retries: int = 4,
+        timeout: float = 60.0,
+    ):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        self.policy = RetryPolicy(retries=retries, timeout=timeout)
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -124,6 +180,7 @@ class OpenAIProvider(Provider):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
             },
+            self.policy,
         )
         return data["choices"][0]["message"]["content"]
 
@@ -131,9 +188,17 @@ class OpenAIProvider(Provider):
 class AnthropicProvider(Provider):
     name = "anthropic"
 
-    def __init__(self, model: str, api_key: str | None = None):
+    def __init__(
+        self,
+        model: str,
+        api_key: str | None = None,
+        *,
+        retries: int = 4,
+        timeout: float = 60.0,
+    ):
         self.model = model
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self.policy = RetryPolicy(retries=retries, timeout=timeout)
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
 
@@ -152,6 +217,7 @@ class AnthropicProvider(Provider):
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
             },
+            self.policy,
         )
         return data["content"][0]["text"]
 
@@ -159,9 +225,17 @@ class AnthropicProvider(Provider):
 class OllamaProvider(Provider):
     name = "ollama"
 
-    def __init__(self, model: str, host: str | None = None):
+    def __init__(
+        self,
+        model: str,
+        host: str | None = None,
+        *,
+        retries: int = 4,
+        timeout: float = 60.0,
+    ):
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        self.policy = RetryPolicy(retries=retries, timeout=timeout)
 
     def complete(self, prompt: str) -> str:
         data = _post_json(
@@ -173,6 +247,7 @@ class OllamaProvider(Provider):
                 "options": {"temperature": 0},
             },
             {"Content-Type": "application/json"},
+            self.policy,
         )
         return data["message"]["content"]
 
@@ -186,6 +261,8 @@ def get_provider(
     host: str | None = None,
     seed: int = 0,
     letter: str = "A",
+    retries: int = 4,
+    timeout: float = 60.0,
 ) -> Provider:
     name = name.lower()
     if name == "echo":
@@ -199,13 +276,13 @@ def get_provider(
     if name == "openai":
         if not model:
             raise RuntimeError("--model is required for openai")
-        return OpenAIProvider(model, api_key, base_url)
+        return OpenAIProvider(model, api_key, base_url, retries=retries, timeout=timeout)
     if name == "anthropic":
         if not model:
             raise RuntimeError("--model is required for anthropic")
-        return AnthropicProvider(model, api_key)
+        return AnthropicProvider(model, api_key, retries=retries, timeout=timeout)
     if name == "ollama":
         if not model:
             raise RuntimeError("--model is required for ollama")
-        return OllamaProvider(model, host)
+        return OllamaProvider(model, host, retries=retries, timeout=timeout)
     raise RuntimeError(f"unknown provider {name!r}; use echo, random, longest, shortest, openai, anthropic or ollama")
